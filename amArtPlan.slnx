@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="GoalsBot.Tests/GoalsBot.Tests.csproj" />
+  <Project Path="GoalsBot/GoalsBot.csproj" />
+</Solution>
