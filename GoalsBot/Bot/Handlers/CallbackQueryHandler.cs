@@ -180,7 +180,17 @@ public sealed class CallbackQueryHandler(
 
         await bot.AnswerCallbackQuery(query.Id, "Syncing…", cancellationToken: ct);
         await bot.SendChatAction(chatId, ChatAction.Typing, cancellationToken: ct);
-        await calendar.SyncDayAsync(userId, date, ct);
+
+        try
+        {
+            await calendar.SyncDayAsync(userId, date, ct);
+        }
+        catch (CalendarNotConfiguredException)
+        {
+            await bot.SendMessage(chatId, "Google Calendar isn't configured on this bot. See README for setup.", cancellationToken: ct);
+            return;
+        }
+
         await bot.SendMessage(chatId, $"📅 Synced to Google Calendar for {parts[1]}.", cancellationToken: ct);
     }
 }

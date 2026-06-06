@@ -36,9 +36,7 @@ builder.Services.AddOptions<LlmOptions>()
     .ValidateOnStart();
 
 builder.Services.AddOptions<GoogleCalendarOptions>()
-    .Bind(builder.Configuration.GetSection(GoogleCalendarOptions.SectionName))
-    .ValidateDataAnnotations()
-    .ValidateOnStart();
+    .Bind(builder.Configuration.GetSection(GoogleCalendarOptions.SectionName));
 
 // --- Persistence ---------------------------------------------------------
 builder.Services.AddDbContextPool<AppDbContext>(opts =>
@@ -114,4 +112,12 @@ builder.Services.AddScoped<IUpdateHandler, SyncHandler>();
 builder.Services.AddHostedService<BotPollingWorker>();
 
 var host = builder.Build();
+
+// Apply pending EF Core migrations on startup so the container/dev box is self-contained.
+using (var scope = host.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    await db.Database.MigrateAsync();
+}
+
 await host.RunAsync();

@@ -20,6 +20,9 @@ public sealed class CalendarService(
 {
     public async Task SyncDayAsync(long userId, DateOnly date, CancellationToken ct)
     {
+        if (!options.Value.IsConfigured)
+            throw new CalendarNotConfiguredException();
+
         var tasks = await taskRepository.GetByUserAndDateAsync(userId, date, ct);
         var payload = BuildPayload(date, tasks);
         var calendarId = options.Value.CalendarId;

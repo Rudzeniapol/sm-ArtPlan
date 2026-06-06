@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-goalsbot}
+      POSTGRES_USER: ${POSTGRES_USER:-goalsbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-goalsbot} -d ${POSTGRES_DB:-goalsbot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # ASP.NET config double-underscore convention: "Bot:Token" -> "Bot__Token"
+      ConnectionStrings__Default: "Host=postgres;Port=5432;Database=${POSTGRES_DB:-goalsbot};Username=${POSTGRES_USER:-goalsbot};Password=${POSTGRES_PASSWORD:-changeme}"
+
+      Bot__Token: ${BOT_TOKEN}
+      Bot__DefaultTimeZoneId: ${BOT_DEFAULT_TIMEZONE:-Etc/UTC}
+
+      Llm__BaseUrl: ${LLM_BASE_URL:-https://api.openai.com/v1/}
+      Llm__ApiKey: ${LLM_API_KEY}
+      Llm__Model: ${LLM_MODEL:-gpt-4o-mini}
+      Llm__TimeoutSeconds: ${LLM_TIMEOUT_SECONDS:-30}
+
+      # Google Calendar is optional. Put your service-account JSON at
+      # ./secrets/google-credentials.json — the file is mounted read-only below.
+      GoogleCalendar__CredentialsPath: ${GOOGLE_CREDENTIALS_PATH:-/secrets/google-credentials.json}
+      GoogleCalendar__CalendarId: ${GOOGLE_CALENDAR_ID:-primary}
+    volumes:
+      - ./secrets:/secrets:ro
+
+volumes:
+  pgdata:

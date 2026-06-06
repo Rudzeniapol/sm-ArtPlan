@@ -24,7 +24,16 @@ public sealed class SyncHandler(
         var date = CommandParsing.ParseDateOrToday(remainder, today);
 
         await bot.SendChatAction(msg.Chat.Id, ChatAction.Typing, cancellationToken: ct);
-        await calendar.SyncDayAsync(msg.From!.Id, date, ct);
+
+        try
+        {
+            await calendar.SyncDayAsync(msg.From!.Id, date, ct);
+        }
+        catch (CalendarNotConfiguredException)
+        {
+            await bot.SendMessage(msg.Chat.Id, "Google Calendar isn't configured on this bot. See README for setup.", cancellationToken: ct);
+            return;
+        }
 
         var iso = date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         await bot.SendMessage(msg.Chat.Id, $"📅 Synced to Google Calendar for {iso}.", cancellationToken: ct);

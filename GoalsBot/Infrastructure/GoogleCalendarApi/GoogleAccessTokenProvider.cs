@@ -37,7 +37,7 @@ public sealed class GoogleAccessTokenProvider(
             if (_cachedToken is not null && now < _cachedTokenExpiresAt - RefreshSkew)
                 return _cachedToken;
 
-            var key = ParseKey(options.Value.CredentialsJson);
+            var key = ParseKey(options.Value);
             var assertion = BuildJwt(key, now);
 
             using var http = httpClientFactory.CreateClient("GoogleAuth");
@@ -66,12 +66,20 @@ public sealed class GoogleAccessTokenProvider(
         }
     }
 
-    private static GoogleServiceAccountKey ParseKey(string credentialsJson)
+    private static GoogleServiceAccountKey ParseKey(GoogleCalendarOptions opts)
     {
-        if (string.IsNullOrWhiteSpace(credentialsJson))
-            throw new InvalidOperationException("GoogleCalendar:CredentialsJson is empty.");
+        var json = opts.CredentialsJson;
+        if (string.IsNullOrWhiteSpace(json) && !string.IsNullOrWhiteSpace(opts.CredentialsPath))
+        {
+            if (!File.Exists(opts.CredentialsPath))
+                throw new InvalidOperationException($"GoogleCalendar:CredentialsPath '{opts.CredentialsPath}' was not found.");
+            json = File.ReadAllText(opts.CredentialsPath);
+        }
 
-        return JsonSerializer.Deserialize(credentialsJson, GoogleCalendarJsonContext.Default.GoogleServiceAccountKey)
+        if (string.IsNullOrWhiteSpace(json))
+            throw new InvalidOperationException("Google Calendar is not configured. Set GoogleCalendar:CredentialsJson or GoogleCalendar:CredentialsPath.");
+
+        return JsonSerializer.Deserialize(json, GoogleCalendarJsonContext.Default.GoogleServiceAccountKey)
             ?? throw new InvalidOperationException("Failed to parse Google service-account credentials.");
     }
 
