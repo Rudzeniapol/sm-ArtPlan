@@ -1,7 +1,7 @@
-using System.Globalization;
 using GoalsBot.Application.Goals;
 using GoalsBot.Application.Tasks;
 using GoalsBot.Bot.Conversation;
+using GoalsBot.Bot.Screens;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
@@ -13,6 +13,7 @@ public sealed class AddGoalHandler(
     IGoalService goalService,
     ITaskService taskService,
     IConversationStateStore stateStore,
+    ScreenManager screens,
     TimeProvider clock) : IUpdateHandler
 {
     public bool CanHandle(Update update)
@@ -26,7 +27,6 @@ public sealed class AddGoalHandler(
         if (stateStore.Get(update.Message.Chat.Id) is not AwaitingGoalText)
             return false;
 
-        // Any other slash-command escapes the pending flow — let it route normally.
         return !update.Message.Text.TrimStart().StartsWith('/');
     }
 
@@ -50,12 +50,24 @@ public sealed class AddGoalHandler(
     private async Task StartFlowAsync(long chatId, string remainder, CancellationToken ct)
     {
         var today = DateOnly.FromDateTime(clock.GetUtcNow().UtcDateTime);
+
+        if (string.IsNullOrWhiteSpace(remainder))
+        {
+            // No date typed → show date picker.
+            var (text, markup) = Views.DatePicker("a", today);
+            await screens.ShowAsync(chatId, text, markup, ct);
+            return;
+        }
+
         var date = CommandParsing.ParseDateOrToday(remainder, today);
+        await PromptForGoalsAsync(chatId, date, ct);
+    }
 
+    public async Task PromptForGoalsAsync(long chatId, DateOnly date, CancellationToken ct)
+    {
         stateStore.Set(chatId, new AwaitingGoalText(date));
-
-        var prompt = $"Tell me your goals for {date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)}. Write freely.";
-        await bot.SendMessage(chatId, prompt, cancellationToken: ct);
+        var (text, markup) = Views.GoalPrompt(date);
+        await screens.ShowAsync(chatId, text, markup, ct);
     }
 
     private async Task CompleteFlowAsync(Message msg, AwaitingGoalText pending, CancellationToken ct)
@@ -64,6 +76,9 @@ public sealed class AddGoalHandler(
         var userId = msg.From!.Id;
         var rawInput = msg.Text!;
 
+        // Step 1: show the "Analyzing…" message immediately so the user knows
+        // we received their text. This replaces the goal-prompt view.
+        await screens.ShowAsync(chatId, Views.AnalyzingText, markup: null, ct);
         await bot.SendChatAction(chatId, ChatAction.Typing, cancellationToken: ct);
 
         try
@@ -75,10 +90,9 @@ public sealed class AddGoalHandler(
             stateStore.Clear(chatId);
         }
 
-        var allTasks = await taskService.GetTasksForDayAsync(userId, pending.Date, ct);
-        var text = TaskFormatter.FormatList(allTasks, pending.Date);
-        var keyboard = TaskFormatter.BuildTaskKeyboard(allTasks, pending.Date);
-
-        await bot.SendMessage(chatId, text, replyMarkup: keyboard, cancellationToken: ct);
+        // Step 2: replace "Analyzing…" with the daily plan view.
+        var list = await taskService.GetTasksForDayAsync(userId, pending.Date, ct);
+        var (text, markup) = Views.TasksList(pending.Date, list);
+        await screens.ShowAsync(chatId, text, markup, ct);
     }
 }

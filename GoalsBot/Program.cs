@@ -7,6 +7,7 @@ using GoalsBot.Bot;
 using GoalsBot.Bot.Conversation;
 using GoalsBot.Bot.Handlers;
 using GoalsBot.Bot.Middleware;
+using GoalsBot.Bot.Screens;
 using GoalsBot.Domain.Repositories;
 using GoalsBot.Infrastructure.Configuration;
 using GoalsBot.Infrastructure.GoogleCalendarApi;
@@ -98,16 +99,27 @@ builder.Services.AddScoped<ICalendarService, CalendarService>();
 builder.Services.AddScoped<UserRegistrationMiddleware>();
 builder.Services.AddScoped<UpdateDispatcher>();
 
-// Order matters: state-aware handlers are tried first so a pending flow takes precedence.
+// Screen state lives across requests; the underlying IMemoryCache is already a singleton.
+builder.Services.AddSingleton<IChatScreenStore, MemoryChatScreenStore>();
+builder.Services.AddScoped<ScreenManager>();
+
+// Handlers needed both as IUpdateHandler (for the dispatcher) and as concrete types
+// (so CallbackQueryHandler and EditTaskHandler can call into them).
+builder.Services.AddScoped<TasksHandler>();
+builder.Services.AddScoped<AddGoalHandler>();
+builder.Services.AddScoped<StatsHandler>();
+builder.Services.AddScoped<SyncHandler>();
 builder.Services.AddScoped<EditTaskHandler>();
+
+// Order matters: state-aware handlers are tried first so a pending flow takes precedence.
 builder.Services.AddScoped<IUpdateHandler>(sp => sp.GetRequiredService<EditTaskHandler>());
-builder.Services.AddScoped<IUpdateHandler, AddGoalHandler>();
+builder.Services.AddScoped<IUpdateHandler>(sp => sp.GetRequiredService<AddGoalHandler>());
 builder.Services.AddScoped<IUpdateHandler, CallbackQueryHandler>();
 builder.Services.AddScoped<IUpdateHandler, StartCommandHandler>();
-builder.Services.AddScoped<IUpdateHandler, TasksHandler>();
+builder.Services.AddScoped<IUpdateHandler>(sp => sp.GetRequiredService<TasksHandler>());
 builder.Services.AddScoped<IUpdateHandler, DeleteTaskHandler>();
-builder.Services.AddScoped<IUpdateHandler, StatsHandler>();
-builder.Services.AddScoped<IUpdateHandler, SyncHandler>();
+builder.Services.AddScoped<IUpdateHandler>(sp => sp.GetRequiredService<StatsHandler>());
+builder.Services.AddScoped<IUpdateHandler>(sp => sp.GetRequiredService<SyncHandler>());
 
 builder.Services.AddHostedService<BotPollingWorker>();
 

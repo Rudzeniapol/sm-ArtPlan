@@ -1,5 +1,6 @@
 using System.Globalization;
 using GoalsBot.Application.Calendar;
+using GoalsBot.Bot.Screens;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
@@ -9,6 +10,7 @@ namespace GoalsBot.Bot.Handlers;
 public sealed class SyncHandler(
     ITelegramBotClient bot,
     ICalendarService calendar,
+    ScreenManager screens,
     TimeProvider clock) : IUpdateHandler
 {
     public bool CanHandle(Update update) =>
@@ -21,21 +23,35 @@ public sealed class SyncHandler(
         CommandParsing.TryParseCommand(msg.Text, "/sync", out var remainder);
 
         var today = DateOnly.FromDateTime(clock.GetUtcNow().UtcDateTime);
-        var date = CommandParsing.ParseDateOrToday(remainder, today);
 
-        await bot.SendChatAction(msg.Chat.Id, ChatAction.Typing, cancellationToken: ct);
+        if (string.IsNullOrWhiteSpace(remainder))
+        {
+            var (text, markup) = Views.DatePicker("s", today);
+            await screens.ShowAsync(msg.Chat.Id, text, markup, ct);
+            return;
+        }
+
+        var date = CommandParsing.ParseDateOrToday(remainder, today);
+        await SyncAndAnnounceAsync(msg.Chat.Id, msg.From!.Id, date, ct);
+    }
+
+    public async Task SyncAndAnnounceAsync(long chatId, long userId, DateOnly date, CancellationToken ct)
+    {
+        await bot.SendChatAction(chatId, ChatAction.Typing, cancellationToken: ct);
+        await screens.ShowAsync(chatId, "📅 Syncing to Google Calendar…", markup: null, ct);
 
         try
         {
-            await calendar.SyncDayAsync(msg.From!.Id, date, ct);
+            await calendar.SyncDayAsync(userId, date, ct);
         }
         catch (CalendarNotConfiguredException)
         {
-            await bot.SendMessage(msg.Chat.Id, "Google Calendar isn't configured on this bot. See README for setup.", cancellationToken: ct);
+            await screens.ShowAsync(chatId, "Google Calendar isn't configured on this bot. See README for setup.", markup: null, ct);
             return;
         }
 
         var iso = date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-        await bot.SendMessage(msg.Chat.Id, $"📅 Synced to Google Calendar for {iso}.", cancellationToken: ct);
+        var (text, markup) = Views.MainMenu();
+        await screens.ShowAsync(chatId, $"📅 Synced {iso} to Google Calendar.\n\n" + text, markup, ct);
     }
 }

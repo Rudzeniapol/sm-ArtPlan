@@ -1,0 +1,25 @@
+Amazing! I used bot for a short period of time and I see some UI/UX flows that I want to fix.
+
+Firstly: main menu should have inline buttons with the same options as listed in commands.
+
+In case of commands with date (YYYY-MM-DD) I suppose user should not manually input date.
+Instead I want user that pressed command with date to receive new message with available dates
+as inline buttons (with inline button to go back). Available dates should be 7 days starting with
+tomorrow. 
+
+I also want to change user flow:
+ - When user sends his/her plan to Bot I want bot to respond immediately that user plan is analyzing
+and then when llm answered and everything is ready then this short message is deleted and swapped with
+daily plan message.
+ - I really like daily plan message shown to user when daily goals are analyzed by LLM. I want it 
+to be the main state user interacts with. But it confuses me that inline button with to edit and delete
+task item take the same space like task description. I would really to make row.Add(InlineKeyboardButton.WithCallbackData($"◻️ {titleSnippet} 
+line take 90% of space if possible
+- I want to have main menu instead of list of commands message. I want this menu consists of 
+inline buttons which launch these commands.
+- I also see the bug when task is marked done its inline button is not removed 
+(edit and delete options available though task item title inline button is not shown)
+- There is also no "Go back" button when going to /tasks.
+- I also want bot to remove previous message when the new one is shown.
+
+Let's stay with these notes for now and implement them.

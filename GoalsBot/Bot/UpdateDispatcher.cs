@@ -1,13 +1,16 @@
 using GoalsBot.Bot.Middleware;
+using GoalsBot.Bot.Screens;
 using Microsoft.Extensions.Logging;
 using Telegram.Bot;
 using Telegram.Bot.Types;
+using Telegram.Bot.Types.Enums;
 
 namespace GoalsBot.Bot;
 
 public sealed class UpdateDispatcher(
     UserRegistrationMiddleware userRegistration,
     IEnumerable<IUpdateHandler> handlers,
+    ScreenManager screens,
     ITelegramBotClient bot,
     ILogger<UpdateDispatcher> logger)
 {
@@ -25,6 +28,12 @@ public sealed class UpdateDispatcher(
             }
 
             await handler.HandleAsync(update, ct);
+
+            // Single-screen UX: hide the user's command/text after we've handled it,
+            // so only the bot's current view remains. Works in private chats; in
+            // groups the bot needs delete-message perms (silently ignored if not).
+            if (update.Type == UpdateType.Message && update.Message is { } msg)
+                await screens.TryDeleteUserMessageAsync(msg.Chat.Id, msg.MessageId, ct);
         }
         catch (OperationCanceledException)
         {

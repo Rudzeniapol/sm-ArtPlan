@@ -1,23 +1,29 @@
 using System.Globalization;
-using GoalsBot.Application.Calendar;
 using GoalsBot.Application.Tasks;
-using GoalsBot.Bot.Conversation;
+using GoalsBot.Bot.Screens;
 using GoalsBot.Domain.Enums;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
-using Telegram.Bot.Types.ReplyMarkups;
 
 namespace GoalsBot.Bot.Handlers;
 
+// Single entry point for every inline-button callback. Each branch:
+//   1. always answers the callback (removes the spinner),
+//   2. delegates to the relevant handler so /tasks-style refresh logic stays in one place.
 public sealed class CallbackQueryHandler(
     ITelegramBotClient bot,
     ITaskService tasks,
-    ICalendarService calendar,
+    ScreenManager screens,
+    AddGoalHandler addHandler,
+    TasksHandler tasksHandler,
+    StatsHandler statsHandler,
+    SyncHandler syncHandler,
     EditTaskHandler editHandler,
-    IConversationStateStore stateStore,
     TimeProvider clock) : IUpdateHandler
 {
+    private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
+
     public bool CanHandle(Update update) =>
         update.Type == UpdateType.CallbackQuery && update.CallbackQuery?.Data is not null;
 
@@ -28,169 +34,181 @@ public sealed class CallbackQueryHandler(
         var chatId = query.Message!.Chat.Id;
         var userId = query.From.Id;
 
-        var parts = data.Split(':');
-        var action = parts[0];
+        // Always answer the callback first to remove the loading spinner.
+        await bot.AnswerCallbackQuery(query.Id, cancellationToken: ct);
 
         try
         {
-            switch (action)
-            {
-                case "complete":
-                    await HandleCompleteAsync(query, chatId, userId, parts, ct);
-                    break;
-                case "delete":
-                    await HandleDeleteAsync(query, chatId, parts, ct);
-                    break;
-                case "edit":
-                    await HandleEditAsync(query, chatId, parts, ct);
-                    break;
-                case "priority":
-                    await HandlePriorityAsync(query, chatId, parts, ct);
-                    break;
-                case "sync":
-                    await HandleSyncAsync(query, chatId, userId, parts, ct);
-                    break;
-                default:
-                    await bot.AnswerCallbackQuery(query.Id, cancellationToken: ct);
-                    break;
-            }
+            await RouteAsync(data, chatId, userId, ct);
         }
         catch (TaskNotFoundException)
         {
-            await bot.AnswerCallbackQuery(query.Id, "Task not found.", cancellationToken: ct);
+            await screens.ShowAsync(chatId, "That task no longer exists.", markup: null, ct);
         }
     }
 
-    private async Task HandleCompleteAsync(CallbackQuery query, long chatId, long userId, string[] parts, CancellationToken ct)
+    private async Task RouteAsync(string data, long chatId, long userId, CancellationToken ct)
     {
-        // complete:{guid}                — show confirm
-        // complete:confirm:{guid}        — apply
-        // complete:cancel                — discard
-        if (parts.Length == 2 && Guid.TryParse(parts[1], out var taskId))
+        // ---- Menu ---------------------------------------------------------
+        if (data == Cb.Menu)
         {
-            var today = DateOnly.FromDateTime(clock.GetUtcNow().UtcDateTime);
-            var list = await tasks.GetTasksForDayAsync(userId, today, ct);
-            var t = list.FirstOrDefault(x => x.Id == taskId);
-            var title = t?.Title ?? taskId.ToString();
+            var (text, markup) = Views.MainMenu();
+            await screens.ShowAsync(chatId, text, markup, ct);
+            return;
+        }
+        if (data == Cb.MenuAdd)   { await ShowPickerAsync(chatId, "a", ct); return; }
+        if (data == Cb.MenuTasks) { await ShowPickerAsync(chatId, "t", ct); return; }
+        if (data == Cb.MenuSync)  { await ShowPickerAsync(chatId, "s", ct); return; }
+        if (data == Cb.MenuStats)
+        {
+            var (text, markup) = Views.StatsMenu();
+            await screens.ShowAsync(chatId, text, markup, ct);
+            return;
+        }
+        if (data == Cb.StatsWeek)  { await statsHandler.ShowStatsAsync(chatId, userId, StatsPeriod.Week,  ct); return; }
+        if (data == Cb.StatsMonth) { await statsHandler.ShowStatsAsync(chatId, userId, StatsPeriod.Month, ct); return; }
 
-            var keyboard = new InlineKeyboardMarkup(new[]
+        // ---- Date picker --------------------------------------------------
+        if (data == Cb.PickCancel)
+        {
+            var (text, markup) = Views.MainMenu();
+            await screens.ShowAsync(chatId, text, markup, ct);
+            return;
+        }
+        if (TryStripPrefix(data, Cb.PickAddPrefix, out var addDateStr) && TryParseDate(addDateStr, out var addDate))
+        {
+            await addHandler.PromptForGoalsAsync(chatId, addDate, ct);
+            return;
+        }
+        if (TryStripPrefix(data, Cb.PickTasksPrefix, out var tDateStr) && TryParseDate(tDateStr, out var tDate))
+        {
+            await tasksHandler.ShowTasksForDateAsync(chatId, userId, tDate, ct);
+            return;
+        }
+        if (TryStripPrefix(data, Cb.PickSyncPrefix, out var sDateStr) && TryParseDate(sDateStr, out var sDate))
+        {
+            await syncHandler.SyncAndAnnounceAsync(chatId, userId, sDate, ct);
+            return;
+        }
+
+        // ---- Tasks-view refresh / back ------------------------------------
+        if (TryStripPrefix(data, Cb.TasksPrefix, out var refreshDateStr) && TryParseDate(refreshDateStr, out var refreshDate))
+        {
+            await tasksHandler.ShowTasksForDateAsync(chatId, userId, refreshDate, ct);
+            return;
+        }
+
+        // ---- Complete -----------------------------------------------------
+        if (TryStripPrefix(data, Cb.CompleteConfirmPrefix, out var ccBody) &&
+            TryParseTaskAndDate(ccBody, out var ccTaskId, out var ccDate))
+        {
+            await tasks.MarkCompleteAsync(ccTaskId, ct);
+            // Refresh the tasks view so the buttons for the just-completed task disappear.
+            await tasksHandler.ShowTasksForDateAsync(chatId, userId, ccDate, ct);
+            return;
+        }
+        if (TryStripPrefix(data, Cb.CompleteCancelPrefix, out var cxDateStr) && TryParseDate(cxDateStr, out var cxDate))
+        {
+            await tasksHandler.ShowTasksForDateAsync(chatId, userId, cxDate, ct);
+            return;
+        }
+        if (TryStripPrefix(data, Cb.CompletePrefix, out var cBody) &&
+            TryParseTaskAndDate(cBody, out var cTaskId, out var cDate))
+        {
+            var iso = cDate.ToString("yyyy-MM-dd", Inv);
+            var (text, markup) = Views.Confirm(
+                "Mark this task as complete?",
+                "Confirm",
+                $"{Cb.CompleteConfirmPrefix}{cTaskId}:{iso}",
+                $"{Cb.CompleteCancelPrefix}{iso}");
+            await screens.ShowAsync(chatId, text, markup, ct);
+            return;
+        }
+
+        // ---- Delete -------------------------------------------------------
+        if (TryStripPrefix(data, Cb.DeleteConfirmPrefix, out var dcBody) &&
+            TryParseTaskAndDate(dcBody, out var dcTaskId, out var dcDate))
+        {
+            await tasks.DeleteAsync(dcTaskId, ct);
+            await tasksHandler.ShowTasksForDateAsync(chatId, userId, dcDate, ct);
+            return;
+        }
+        if (TryStripPrefix(data, Cb.DeleteCancelPrefix, out var dxDateStr) && TryParseDate(dxDateStr, out var dxDate))
+        {
+            await tasksHandler.ShowTasksForDateAsync(chatId, userId, dxDate, ct);
+            return;
+        }
+        if (TryStripPrefix(data, Cb.DeletePrefix, out var dBody) &&
+            TryParseTaskAndDate(dBody, out var dTaskId, out var dDate))
+        {
+            var iso = dDate.ToString("yyyy-MM-dd", Inv);
+            var (text, markup) = Views.Confirm(
+                "Delete this task?",
+                "Yes, delete",
+                $"{Cb.DeleteConfirmPrefix}{dTaskId}:{iso}",
+                $"{Cb.DeleteCancelPrefix}{iso}");
+            await screens.ShowAsync(chatId, text, markup, ct);
+            return;
+        }
+
+        // ---- Edit ---------------------------------------------------------
+        if (TryStripPrefix(data, Cb.EditPrefix, out var eBody) &&
+            TryParseTaskAndDate(eBody, out var eTaskId, out var eDate))
+        {
+            await editHandler.StartFlowAsync(chatId, eTaskId, eDate, ct);
+            return;
+        }
+
+        // ---- Priority (during /edit) --------------------------------------
+        if (TryStripPrefix(data, Cb.PriorityPrefix, out var prValue))
+        {
+            TaskPriority? priority = prValue switch
             {
-                new[]
-                {
-                    InlineKeyboardButton.WithCallbackData("Confirm", $"complete:confirm:{taskId}"),
-                    InlineKeyboardButton.WithCallbackData("Cancel", "complete:cancel")
-                }
-            });
-
-            await bot.AnswerCallbackQuery(query.Id, cancellationToken: ct);
-            await bot.SendMessage(chatId, $"Mark '{title}' as complete?", replyMarkup: keyboard, cancellationToken: ct);
+                "Low" => TaskPriority.Low,
+                "Medium" => TaskPriority.Medium,
+                "High" => TaskPriority.High,
+                _ => null
+            };
+            await editHandler.ApplyPriorityAsync(chatId, priority, ct);
             return;
         }
 
-        if (parts.Length == 3 && parts[1] == "confirm" && Guid.TryParse(parts[2], out var confirmId))
-        {
-            await tasks.MarkCompleteAsync(confirmId, ct);
-            await bot.AnswerCallbackQuery(query.Id, "Marked complete ✅", cancellationToken: ct);
-            await bot.EditMessageText(chatId, query.Message!.MessageId, "✅ Done.", cancellationToken: ct);
-            return;
-        }
-
-        if (parts.Length == 2 && parts[1] == "cancel")
-        {
-            await bot.AnswerCallbackQuery(query.Id, cancellationToken: ct);
-            await bot.EditMessageText(chatId, query.Message!.MessageId, "Cancelled.", cancellationToken: ct);
-        }
+        // Unknown callback — silently ignore (spinner was already cleared).
     }
 
-    private async Task HandleDeleteAsync(CallbackQuery query, long chatId, string[] parts, CancellationToken ct)
+    private async Task ShowPickerAsync(long chatId, string kind, CancellationToken ct)
     {
-        // delete:{guid}, delete:confirm:{guid}, delete:cancel
-        if (parts.Length == 2 && Guid.TryParse(parts[1], out var taskId))
-        {
-            var keyboard = new InlineKeyboardMarkup(new[]
-            {
-                new[]
-                {
-                    InlineKeyboardButton.WithCallbackData("Yes, delete", $"delete:confirm:{taskId}"),
-                    InlineKeyboardButton.WithCallbackData("Cancel", "delete:cancel")
-                }
-            });
-            await bot.AnswerCallbackQuery(query.Id, cancellationToken: ct);
-            await bot.SendMessage(chatId, "Delete this task?", replyMarkup: keyboard, cancellationToken: ct);
-            return;
-        }
-
-        if (parts.Length == 3 && parts[1] == "confirm" && Guid.TryParse(parts[2], out var confirmId))
-        {
-            await tasks.DeleteAsync(confirmId, ct);
-            await bot.AnswerCallbackQuery(query.Id, "Deleted 🗑", cancellationToken: ct);
-            await bot.EditMessageText(chatId, query.Message!.MessageId, "🗑 Deleted.", cancellationToken: ct);
-            return;
-        }
-
-        if (parts.Length == 2 && parts[1] == "cancel")
-        {
-            await bot.AnswerCallbackQuery(query.Id, cancellationToken: ct);
-            await bot.EditMessageText(chatId, query.Message!.MessageId, "Cancelled.", cancellationToken: ct);
-        }
+        var today = DateOnly.FromDateTime(clock.GetUtcNow().UtcDateTime);
+        var (text, markup) = Views.DatePicker(kind, today);
+        await screens.ShowAsync(chatId, text, markup, ct);
     }
 
-    private async Task HandleEditAsync(CallbackQuery query, long chatId, string[] parts, CancellationToken ct)
+    private static bool TryStripPrefix(string data, string prefix, out string remainder)
     {
-        if (parts.Length != 2 || !Guid.TryParse(parts[1], out var taskId))
+        if (data.StartsWith(prefix, StringComparison.Ordinal))
         {
-            await bot.AnswerCallbackQuery(query.Id, cancellationToken: ct);
-            return;
+            remainder = data[prefix.Length..];
+            return true;
         }
-
-        stateStore.Set(chatId, new AwaitingEditTitle(taskId, new EditDraft()));
-        await bot.AnswerCallbackQuery(query.Id, cancellationToken: ct);
-        await bot.SendMessage(chatId, "New title? Send the new text, or /skip to keep the current one.", cancellationToken: ct);
+        remainder = string.Empty;
+        return false;
     }
 
-    private async Task HandlePriorityAsync(CallbackQuery query, long chatId, string[] parts, CancellationToken ct)
+    private static bool TryParseDate(string value, out DateOnly date) =>
+        DateOnly.TryParseExact(value, "yyyy-MM-dd", Inv, DateTimeStyles.None, out date);
+
+    private static bool TryParseTaskAndDate(string body, out Guid taskId, out DateOnly date)
     {
-        // priority:{guid}:Low|Medium|High|skip
-        if (parts.Length != 3 || !Guid.TryParse(parts[1], out var taskId))
+        // body has the form "{guid}:{yyyy-MM-dd}"
+        var colon = body.IndexOf(':');
+        if (colon > 0 &&
+            Guid.TryParse(body[..colon], out taskId) &&
+            DateOnly.TryParseExact(body[(colon + 1)..], "yyyy-MM-dd", Inv, DateTimeStyles.None, out date))
         {
-            await bot.AnswerCallbackQuery(query.Id, cancellationToken: ct);
-            return;
+            return true;
         }
-
-        TaskPriority? priority = parts[2] switch
-        {
-            "Low" => TaskPriority.Low,
-            "Medium" => TaskPriority.Medium,
-            "High" => TaskPriority.High,
-            _ => null
-        };
-
-        await bot.AnswerCallbackQuery(query.Id, cancellationToken: ct);
-        await editHandler.ApplyPriorityAsync(chatId, taskId, priority, ct);
-    }
-
-    private async Task HandleSyncAsync(CallbackQuery query, long chatId, long userId, string[] parts, CancellationToken ct)
-    {
-        if (parts.Length != 2 ||
-            !DateOnly.TryParseExact(parts[1], "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var date))
-        {
-            await bot.AnswerCallbackQuery(query.Id, cancellationToken: ct);
-            return;
-        }
-
-        await bot.AnswerCallbackQuery(query.Id, "Syncing…", cancellationToken: ct);
-        await bot.SendChatAction(chatId, ChatAction.Typing, cancellationToken: ct);
-
-        try
-        {
-            await calendar.SyncDayAsync(userId, date, ct);
-        }
-        catch (CalendarNotConfiguredException)
-        {
-            await bot.SendMessage(chatId, "Google Calendar isn't configured on this bot. See README for setup.", cancellationToken: ct);
-            return;
-        }
-
-        await bot.SendMessage(chatId, $"📅 Synced to Google Calendar for {parts[1]}.", cancellationToken: ct);
+        taskId = Guid.Empty;
+        date = default;
+        return false;
     }
 }

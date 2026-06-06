@@ -1,17 +1,19 @@
 using GoalsBot.Application.Tasks;
 using GoalsBot.Bot.Conversation;
+using GoalsBot.Bot.Screens;
 using GoalsBot.Domain.Enums;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
-using Telegram.Bot.Types.ReplyMarkups;
 
 namespace GoalsBot.Bot.Handlers;
 
 public sealed class EditTaskHandler(
-    ITelegramBotClient bot,
     ITaskService tasks,
-    IConversationStateStore stateStore) : IUpdateHandler
+    IConversationStateStore stateStore,
+    ScreenManager screens,
+    TasksHandler tasksHandler,
+    TimeProvider clock) : IUpdateHandler
 {
     private const string SkipToken = "/skip";
 
@@ -26,7 +28,6 @@ public sealed class EditTaskHandler(
         if (state is not (AwaitingEditTitle or AwaitingEditDescription or AwaitingEditEstimate))
             return false;
 
-        // Allow /skip inside the flow; any other slash-command escapes it.
         var text = update.Message.Text.TrimStart();
         return !text.StartsWith('/') || text.Equals(SkipToken, StringComparison.OrdinalIgnoreCase);
     }
@@ -39,7 +40,7 @@ public sealed class EditTaskHandler(
 
         if (CommandParsing.TryParseCommand(text, "/edit", out var remainder))
         {
-            await StartFlowAsync(chatId, remainder, ct);
+            await StartFromCommandAsync(chatId, remainder, ct);
             return;
         }
 
@@ -53,21 +54,32 @@ public sealed class EditTaskHandler(
                 await StepDescriptionAsync(chatId, s, text, ct);
                 break;
             case AwaitingEditEstimate s:
-                await StepEstimateAsync(chatId, s, text, ct);
+                await StepEstimateAsync(chatId, msg.From!.Id, s, text, ct);
                 break;
         }
     }
 
-    private async Task StartFlowAsync(long chatId, string remainder, CancellationToken ct)
+    private async Task StartFromCommandAsync(long chatId, string remainder, CancellationToken ct)
     {
         if (!Guid.TryParse(remainder, out var taskId))
         {
-            await bot.SendMessage(chatId, "Usage: /edit {taskId}", cancellationToken: ct);
+            await screens.ShowAsync(chatId, "Usage: /edit {taskId}", markup: null, ct);
             return;
         }
 
-        stateStore.Set(chatId, new AwaitingEditTitle(taskId, new EditDraft()));
-        await bot.SendMessage(chatId, "New title? Send the new text, or /skip to keep the current one.", cancellationToken: ct);
+        var today = DateOnly.FromDateTime(clock.GetUtcNow().UtcDateTime);
+        await StartFlowAsync(chatId, taskId, today, ct);
+    }
+
+    // Entry point used by CallbackQueryHandler when user taps "✏️ Edit".
+    public async Task StartFlowAsync(long chatId, Guid taskId, DateOnly date, CancellationToken ct)
+    {
+        stateStore.Set(chatId, new AwaitingEditTitle(taskId, date, new EditDraft()));
+        await screens.ShowAsync(
+            chatId,
+            "✏️ Editing task\nSend a new title, or type /skip to keep the current one.",
+            markup: null,
+            ct);
     }
 
     private async Task StepTitleAsync(long chatId, AwaitingEditTitle state, string text, CancellationToken ct)
@@ -77,8 +89,9 @@ public sealed class EditTaskHandler(
             state.Draft.Title = text.Length > 200 ? text[..200] : text;
             state.Draft.TitleSet = true;
         }
-        stateStore.Set(chatId, new AwaitingEditDescription(state.TaskId, state.Draft));
-        await bot.SendMessage(chatId, "New description? Send the text, or /skip.", cancellationToken: ct);
+
+        stateStore.Set(chatId, new AwaitingEditDescription(state.TaskId, state.Date, state.Draft));
+        await screens.ShowAsync(chatId, "Send a new description, or /skip.", markup: null, ct);
     }
 
     private async Task StepDescriptionAsync(long chatId, AwaitingEditDescription state, string text, CancellationToken ct)
@@ -88,49 +101,39 @@ public sealed class EditTaskHandler(
             state.Draft.Description = text.Length > 1000 ? text[..1000] : text;
             state.Draft.DescriptionSet = true;
         }
-        stateStore.Set(chatId, new AwaitingEditPriority(state.TaskId, state.Draft));
 
-        var keyboard = new InlineKeyboardMarkup(new[]
-        {
-            new[]
-            {
-                InlineKeyboardButton.WithCallbackData("Low", $"priority:{state.TaskId}:Low"),
-                InlineKeyboardButton.WithCallbackData("Medium", $"priority:{state.TaskId}:Medium"),
-                InlineKeyboardButton.WithCallbackData("High", $"priority:{state.TaskId}:High")
-            },
-            new[] { InlineKeyboardButton.WithCallbackData("Skip", $"priority:{state.TaskId}:skip") }
-        });
-        await bot.SendMessage(chatId, "Pick a priority:", replyMarkup: keyboard, cancellationToken: ct);
+        stateStore.Set(chatId, new AwaitingEditPriority(state.TaskId, state.Date, state.Draft));
+        var (prText, prMarkup) = Views.PriorityPicker();
+        await screens.ShowAsync(chatId, prText, prMarkup, ct);
     }
 
-    private async Task StepEstimateAsync(long chatId, AwaitingEditEstimate state, string text, CancellationToken ct)
+    private async Task StepEstimateAsync(long chatId, long userId, AwaitingEditEstimate state, string text, CancellationToken ct)
     {
         if (!string.Equals(text, SkipToken, StringComparison.OrdinalIgnoreCase))
         {
             if (!int.TryParse(text, out var minutes) || minutes < 0)
             {
-                await bot.SendMessage(chatId, "Please send a positive number of minutes, or /skip.", cancellationToken: ct);
+                await screens.ShowAsync(chatId, "Please send a positive number of minutes, or /skip.", markup: null, ct);
                 return;
             }
             state.Draft.EstimatedMinutes = minutes;
             state.Draft.EstimateSet = true;
         }
 
-        await PersistAsync(chatId, state.TaskId, state.Draft, ct);
+        await PersistAndReturnAsync(chatId, userId, state.TaskId, state.Date, state.Draft, ct);
     }
 
     // Called by CallbackQueryHandler once the user taps a priority button.
-    public async Task ApplyPriorityAsync(long chatId, Guid taskId, TaskPriority? priority, CancellationToken ct)
+    public async Task ApplyPriorityAsync(long chatId, TaskPriority? priority, CancellationToken ct)
     {
-        if (stateStore.Get(chatId) is not AwaitingEditPriority state || state.TaskId != taskId)
-            return;
+        if (stateStore.Get(chatId) is not AwaitingEditPriority state) return;
 
         state.Draft.Priority = priority;
-        stateStore.Set(chatId, new AwaitingEditEstimate(taskId, state.Draft));
-        await bot.SendMessage(chatId, "Estimated minutes? Send a number, or /skip.", cancellationToken: ct);
+        stateStore.Set(chatId, new AwaitingEditEstimate(state.TaskId, state.Date, state.Draft));
+        await screens.ShowAsync(chatId, "Estimated minutes? Send a number, or /skip.", markup: null, ct);
     }
 
-    private async Task PersistAsync(long chatId, Guid taskId, EditDraft draft, CancellationToken ct)
+    private async Task PersistAndReturnAsync(long chatId, long userId, Guid taskId, DateOnly date, EditDraft draft, CancellationToken ct)
     {
         var dto = new UpdateTaskDto(
             draft.TitleSet ? draft.Title : null,
@@ -140,14 +143,17 @@ public sealed class EditTaskHandler(
 
         try
         {
-            var updated = await tasks.UpdateAsync(taskId, dto, ct);
-            stateStore.Clear(chatId);
-            await bot.SendMessage(chatId, $"✅ Updated: {updated.Title} ({updated.Priority})", cancellationToken: ct);
+            await tasks.UpdateAsync(taskId, dto, ct);
         }
         catch (TaskNotFoundException)
         {
-            stateStore.Clear(chatId);
-            await bot.SendMessage(chatId, "Task not found.", cancellationToken: ct);
+            // Fall through to refresh — the tasks view will show whatever's there now.
         }
+        finally
+        {
+            stateStore.Clear(chatId);
+        }
+
+        await tasksHandler.ShowTasksForDateAsync(chatId, userId, date, ct);
     }
 }

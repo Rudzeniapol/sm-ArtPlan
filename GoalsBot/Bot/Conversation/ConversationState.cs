@@ -6,10 +6,12 @@ public abstract record ConversationState;
 
 public sealed record AwaitingGoalText(DateOnly Date) : ConversationState;
 
-public sealed record AwaitingEditTitle(Guid TaskId, EditDraft Draft) : ConversationState;
-public sealed record AwaitingEditDescription(Guid TaskId, EditDraft Draft) : ConversationState;
-public sealed record AwaitingEditPriority(Guid TaskId, EditDraft Draft) : ConversationState;
-public sealed record AwaitingEditEstimate(Guid TaskId, EditDraft Draft) : ConversationState;
+// Edit-wizard states carry the originating date so the "back to tasks" view
+// after the wizard ends knows which day to render.
+public sealed record AwaitingEditTitle(Guid TaskId, DateOnly Date, EditDraft Draft) : ConversationState;
+public sealed record AwaitingEditDescription(Guid TaskId, DateOnly Date, EditDraft Draft) : ConversationState;
+public sealed record AwaitingEditPriority(Guid TaskId, DateOnly Date, EditDraft Draft) : ConversationState;
+public sealed record AwaitingEditEstimate(Guid TaskId, DateOnly Date, EditDraft Draft) : ConversationState;
 
 public sealed class EditDraft
 {
